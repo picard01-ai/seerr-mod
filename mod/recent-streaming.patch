@@ -1,9 +1,10 @@
-From 0fc631ea5dfa0798ac4fd71bc6c20c53138e37f8 Mon Sep 17 00:00:00 2001
+From 3facadf7c0de39e70a82015203d4a86704bce747 Mon Sep 17 00:00:00 2001
 From: seerr-mod <mod@localhost>
 Date: Mon, 9 Nov 2026 20:06:05 -0800
 Subject: [PATCH] Add 'Recently Released' streaming-service Discover sliders
 
 ---
+ seerr-api.yml                                 | 45 +++++++++++++
  server/api/themoviedb/index.ts                | 27 ++++++++
  server/constants/discover.ts                  |  4 ++
  server/routes/discover.ts                     | 24 +++++++
@@ -12,9 +13,72 @@ Subject: [PATCH] Add 'Recently Released' streaming-service Discover sliders
  src/components/Discover/constants.ts          |  2 +
  src/components/Discover/index.tsx             | 24 +++++++
  src/utils/recentStreaming.ts                  | 67 +++++++++++++++++++
- 8 files changed, 176 insertions(+)
+ 9 files changed, 221 insertions(+)
  create mode 100644 src/utils/recentStreaming.ts
 
+diff --git a/seerr-api.yml b/seerr-api.yml
+index ae1fdc2..2c14c69 100644
+--- a/seerr-api.yml
++++ b/seerr-api.yml
+@@ -5674,6 +5674,31 @@ paths:
+           schema:
+             type: string
+             example: 2023-01-01
++        - in: query
++          name: releaseDateGte
++          schema:
++            type: string
++            example: 2022-01-01
++        - in: query
++          name: releaseDateLte
++          schema:
++            type: string
++            example: 2023-01-01
++        - in: query
++          name: releaseType
++          schema:
++            type: string
++            example: 4|6
++        - in: query
++          name: excludeGenres
++          schema:
++            type: string
++            example: 10763|10767
++        - in: query
++          name: watchMonetizationTypes
++          schema:
++            type: string
++            example: flatrate
+         - in: query
+           name: withRuntimeGte
+           schema:
+@@ -6000,6 +6025,26 @@ paths:
+           schema:
+             type: string
+             example: 2023-01-01
++        - in: query
++          name: airDateGte
++          schema:
++            type: string
++            example: 2022-01-01
++        - in: query
++          name: airDateLte
++          schema:
++            type: string
++            example: 2023-01-01
++        - in: query
++          name: excludeGenres
++          schema:
++            type: string
++            example: 10763|10767
++        - in: query
++          name: watchMonetizationTypes
++          schema:
++            type: string
++            example: flatrate
+         - in: query
+           name: withRuntimeGte
+           schema:
 diff --git a/server/api/themoviedb/index.ts b/server/api/themoviedb/index.ts
 index 4693b3e..9053d95 100644
 --- a/server/api/themoviedb/index.ts
