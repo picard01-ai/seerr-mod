@@ -1,23 +1,31 @@
-From 3facadf7c0de39e70a82015203d4a86704bce747 Mon Sep 17 00:00:00 2001
+From b391c47f9af0d1cd813e11acddac984e226a7672 Mon Sep 17 00:00:00 2001
 From: seerr-mod <mod@localhost>
 Date: Mon, 9 Nov 2026 20:06:05 -0800
 Subject: [PATCH] Add 'Recently Released' streaming-service Discover sliders
 
 ---
- seerr-api.yml                                 | 45 +++++++++++++
- server/api/themoviedb/index.ts                | 27 ++++++++
- server/constants/discover.ts                  |  4 ++
- server/routes/discover.ts                     | 24 +++++++
- .../Discover/CreateSlider/index.tsx           | 24 +++++++
- .../Discover/DiscoverSliderEdit/index.tsx     |  4 ++
- src/components/Discover/constants.ts          |  2 +
- src/components/Discover/index.tsx             | 24 +++++++
- src/utils/recentStreaming.ts                  | 67 +++++++++++++++++++
- 9 files changed, 221 insertions(+)
+ seerr-api.yml                                 |  91 ++++++
+ server/api/streamingavailability.ts           | 264 ++++++++++++++++++
+ server/api/themoviedb/index.ts                |  27 ++
+ server/constants/discover.ts                  |   4 +
+ server/routes/discover.ts                     | 211 +++++++++++++-
+ .../Discover/CreateSlider/index.tsx           |  26 ++
+ .../Discover/DiscoverSliderEdit/index.tsx     |   4 +
+ .../Discover/RecentStreaming/index.tsx        |  74 +++++
+ src/components/Discover/constants.ts          |   2 +
+ src/components/Discover/index.tsx             |  33 +++
+ src/pages/discover/recent/movies.tsx          |   8 +
+ src/pages/discover/recent/tv.tsx              |   8 +
+ src/utils/recentStreaming.ts                  |  82 ++++++
+ 13 files changed, 833 insertions(+), 1 deletion(-)
+ create mode 100644 server/api/streamingavailability.ts
+ create mode 100644 src/components/Discover/RecentStreaming/index.tsx
+ create mode 100644 src/pages/discover/recent/movies.tsx
+ create mode 100644 src/pages/discover/recent/tv.tsx
  create mode 100644 src/utils/recentStreaming.ts
 
 diff --git a/seerr-api.yml b/seerr-api.yml
-index ae1fdc2..2c14c69 100644
+index ae1fdc2..90002f5 100644
 --- a/seerr-api.yml
 +++ b/seerr-api.yml
 @@ -5674,6 +5674,31 @@ paths:
@@ -52,7 +60,60 @@ index ae1fdc2..2c14c69 100644
          - in: query
            name: withRuntimeGte
            schema:
-@@ -6000,6 +6025,26 @@ paths:
+@@ -5907,6 +5932,52 @@ paths:
+                     type: array
+                     items:
+                       $ref: '#/components/schemas/MovieResult'
++  /discover/movies/recent-streaming:
++    get:
++      summary: Movies recently added to streaming services
++      description: Movies recently added to the given streaming services (Streaming Availability API, falling back to TMDB release dates).
++      tags:
++        - search
++      parameters:
++        - in: query
++          name: page
++          schema:
++            type: number
++            example: 1
++            default: 1
++        - in: query
++          name: language
++          schema:
++            type: string
++            example: en
++        - in: query
++          name: watchRegion
++          schema:
++            type: string
++            example: US
++        - in: query
++          name: watchProviders
++          schema:
++            type: string
++            example: 8|1899
++      responses:
++        '200':
++          description: Results
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  page:
++                    type: number
++                  totalPages:
++                    type: number
++                  totalResults:
++                    type: number
++                  results:
++                    type: array
++                    items:
++                      $ref: '#/components/schemas/MovieResult'
+   /discover/movies/upcoming:
+     get:
+       summary: Upcoming movies
+@@ -6000,6 +6071,26 @@ paths:
            schema:
              type: string
              example: 2023-01-01
@@ -79,6 +140,276 @@ index ae1fdc2..2c14c69 100644
          - in: query
            name: withRuntimeGte
            schema:
+diff --git a/server/api/streamingavailability.ts b/server/api/streamingavailability.ts
+new file mode 100644
+index 0000000..4ae6a0d
+--- /dev/null
++++ b/server/api/streamingavailability.ts
+@@ -0,0 +1,264 @@
++// Custom mod: Streaming Availability API (movieofthenight.com) client.
++//
++// Used by the "Recently Released Movies (Streaming Services)" slider to find
++// movies that were *added to* the selected streaming services recently, which
++// TMDB cannot tell us.
++//
++// Configure with environment variables on the container:
++//   STREAMING_AVAILABILITY_API_KEY   your API key (required to enable this)
++//   STREAMING_AVAILABILITY_RAPIDAPI  "true" if the key came from rapidapi.com
++//                                    (default: key from movieofthenight.com)
++//   STREAMING_AVAILABILITY_MAX_PAGES pages of 25 changes fetched per refresh
++//                                    (default 8)
++//   STREAMING_AVAILABILITY_REFRESH_HOURS  how long results are reused
++//                                    (default 12)
++import logger from '@server/logger';
++import type { AxiosInstance } from 'axios';
++import axios from 'axios';
++
++const LABEL = 'Streaming Availability';
++const DAY = 24 * 60 * 60;
++
++interface SaService {
++  id: string;
++  name: string;
++}
++
++interface SaChange {
++  changeType: string;
++  itemType: string;
++  showId: string;
++  showType?: string;
++  streamingOptionType?: string;
++  service?: { id: string; name: string };
++  timestamp?: number;
++}
++
++interface SaShow {
++  id: string;
++  tmdbId?: string;
++  showType?: string;
++  title?: string;
++}
++
++interface SaChangesResult {
++  changes: SaChange[];
++  shows: Record<string, SaShow>;
++  hasMore: boolean;
++  nextCursor?: string;
++}
++
++export interface RecentStreamingMovie {
++  tmdbId: number;
++  addedAt: number; // unix seconds
++  serviceId: string;
++}
++
++const envNumber = (name: string, fallback: number): number => {
++  const value = Number(process.env[name]);
++  return Number.isFinite(value) && value > 0 ? value : fallback;
++};
++
++/** Lower-case a service name and strip words that differ between TMDB and SA. */
++export const normalizeServiceName = (name: string): string => {
++  let n = name.toLowerCase().replace(/\+/g, 'plus');
++  n = n.replace(
++    /\b(amazon|premium|standard|basic|essential|with ads|ads|channel|plus)\b/g,
++    ''
++  );
++  n = n.replace(/[^a-z0-9]/g, '');
++  n = n.replace(/plus$/, '');
++  if (n === 'max' || n === 'hbo') n = 'hbomax';
++  return n;
++};
++
++class StreamingAvailabilityAPI {
++  private axios: AxiosInstance;
++  private servicesCache = new Map<
++    string,
++    { at: number; services: SaService[] }
++  >();
++  private moviesCache = new Map<
++    string,
++    { at: number; movies: RecentStreamingMovie[] }
++  >();
++  private inFlight = new Map<string, Promise<RecentStreamingMovie[]>>();
++
++  constructor(apiKey: string, rapidApi: boolean) {
++    this.axios = axios.create({
++      baseURL: rapidApi
++        ? 'https://streaming-availability.p.rapidapi.com'
++        : 'https://api.movieofthenight.com/v4',
++      timeout: 20000,
++      headers: rapidApi
++        ? {
++            'X-RapidAPI-Key': apiKey,
++            'X-RapidAPI-Host': 'streaming-availability.p.rapidapi.com',
++          }
++        : { 'X-API-Key': apiKey },
++    });
++  }
++
++  private refreshSeconds(): number {
++    return envNumber('STREAMING_AVAILABILITY_REFRESH_HOURS', 12) * 3600;
++  }
++
++  /** Services available in a country (cached for a day). */
++  public async getServices(country: string): Promise<SaService[]> {
++    const key = country.toLowerCase();
++    const now = Date.now() / 1000;
++    const cached = this.servicesCache.get(key);
++    if (cached && now - cached.at < DAY) {
++      return cached.services;
++    }
++    const response = await this.axios.get<{
++      services?: { id: string; name: string }[];
++    }>(`/countries/${key}`, { params: { output_language: 'en' } });
++    const services = (response.data.services ?? []).map((s) => ({
++      id: s.id,
++      name: s.name,
++    }));
++    this.servicesCache.set(key, { at: now, services });
++    return services;
++  }
++
++  /** Match TMDB provider names to Streaming Availability service ids. */
++  public async matchServices(
++    country: string,
++    providerNames: string[]
++  ): Promise<string[]> {
++    const services = await this.getServices(country);
++    const ids = new Set<string>();
++    for (const providerName of providerNames) {
++      const wanted = normalizeServiceName(providerName);
++      const match =
++        services.find((s) => normalizeServiceName(s.name) === wanted) ??
++        services.find((s) => s.id === wanted) ??
++        services.find((s) => {
++          const n = normalizeServiceName(s.name);
++          return n.length > 2 && (wanted.startsWith(n) || n.startsWith(wanted));
++        });
++      if (match) {
++        ids.add(match.id);
++      } else {
++        logger.debug(`No Streaming Availability service for "${providerName}"`, {
++          label: LABEL,
++        });
++      }
++    }
++    return [...ids];
++  }
++
++  /**
++   * Movies newly added (with a subscription) to the given services in the
++   * last 30 days, newest first. Cached per country + service list.
++   */
++  public async getRecentMovies(
++    country: string,
++    serviceIds: string[]
++  ): Promise<RecentStreamingMovie[]> {
++    const services = [...serviceIds].sort();
++    const key = `${country.toLowerCase()}|${services.join(',')}`;
++    const now = Math.floor(Date.now() / 1000);
++    const cached = this.moviesCache.get(key);
++    if (cached && now - cached.at < this.refreshSeconds()) {
++      return cached.movies;
++    }
++    const pending = this.inFlight.get(key);
++    if (pending) {
++      return pending;
++    }
++
++    const promise = this.fetchRecentMovies(country, services, now)
++      .then((movies) => {
++        this.moviesCache.set(key, { at: now, movies });
++        return movies;
++      })
++      .catch((e) => {
++        if (cached) {
++          logger.warn('Using older results after a refresh failed', {
++            label: LABEL,
++            errorMessage: e.message,
++          });
++          return cached.movies;
++        }
++        throw e;
++      })
++      .finally(() => this.inFlight.delete(key));
++    this.inFlight.set(key, promise);
++    return promise;
++  }
++
++  private async fetchRecentMovies(
++    country: string,
++    services: string[],
++    now: number
++  ): Promise<RecentStreamingMovie[]> {
++    const maxPages = envNumber('STREAMING_AVAILABILITY_MAX_PAGES', 8);
++    const catalogs = services.map((s) => `${s}.subscription`).join(',');
++    const seen = new Map<number, RecentStreamingMovie>();
++    let cursor: string | undefined;
++
++    for (let page = 0; page < maxPages; page++) {
++      const response = await this.axios.get<SaChangesResult>('/changes', {
++        params: {
++          country: country.toLowerCase(),
++          catalogs,
++          change_type: 'new',
++          item_type: 'show',
++          show_type: 'movie',
++          from: now - 30 * DAY,
++          order_direction: 'desc',
++          output_language: 'en',
++          cursor,
++        },
++      });
++      const { changes = [], shows = {}, hasMore, nextCursor } = response.data;
++
++      for (const change of changes) {
++        const tmdb = shows[change.showId]?.tmdbId; // e.g. "movie/597"
++        const match = tmdb?.match(/^movie\/(\d+)$/);
++        if (!match) continue;
++        const tmdbId = Number(match[1]);
++        if (!seen.has(tmdbId)) {
++          seen.set(tmdbId, {
++            tmdbId,
++            addedAt: change.timestamp ?? now,
++            serviceId: change.service?.id ?? '',
++          });
++        }
++      }
++
++      if (!hasMore || !nextCursor) break;
++      cursor = nextCursor;
++    }
++
++    logger.info(
++      `Fetched ${seen.size} recently added movies for ${country.toUpperCase()} (${services.join(', ')})`,
++      { label: LABEL }
++    );
++    return [...seen.values()];
++  }
++}
++
++let instance: StreamingAvailabilityAPI | null | undefined;
++
++/** Returns the client, or null when no API key is configured. */
++export const getStreamingAvailability = (): StreamingAvailabilityAPI | null => {
++  if (instance === undefined) {
++    const apiKey = process.env.STREAMING_AVAILABILITY_API_KEY?.trim();
++    instance = apiKey
++      ? new StreamingAvailabilityAPI(
++          apiKey,
++          process.env.STREAMING_AVAILABILITY_RAPIDAPI === 'true'
++        )
++      : null;
++    if (!instance) {
++      logger.info(
++        'STREAMING_AVAILABILITY_API_KEY not set; recent movie slider uses TMDB dates',
++        { label: LABEL }
++      );
++    }
++  }
++  return instance;
++};
 diff --git a/server/api/themoviedb/index.ts b/server/api/themoviedb/index.ts
 index 4693b3e..9053d95 100644
 --- a/server/api/themoviedb/index.ts
@@ -168,10 +499,26 @@ index fda0682..006800a 100644
  
  export const defaultSliders: Partial<DiscoverSlider>[] = [
 diff --git a/server/routes/discover.ts b/server/routes/discover.ts
-index a949764..4914e52 100644
+index a949764..e1ba6a9 100644
 --- a/server/routes/discover.ts
 +++ b/server/routes/discover.ts
-@@ -68,6 +68,13 @@ const QueryFilterOptions = z.object({
+@@ -1,9 +1,14 @@
+ import PlexTvAPI from '@server/api/plextv';
++import type { RecentStreamingMovie } from '@server/api/streamingavailability';
++import { getStreamingAvailability } from '@server/api/streamingavailability';
+ import TheMovieDb, {
+   MovieSortOptionsIterable,
+   TvSortOptionsIterable,
+ } from '@server/api/themoviedb';
+-import type { TmdbKeyword } from '@server/api/themoviedb/interfaces';
++import type {
++  TmdbKeyword,
++  TmdbMovieResult,
++} from '@server/api/themoviedb/interfaces';
+ import { MediaType } from '@server/constants/media';
+ import { getRepository } from '@server/datasource';
+ import Media from '@server/entity/Media';
+@@ -68,6 +73,13 @@ const QueryFilterOptions = z.object({
    primaryReleaseDateLte: z.coerce.string().optional(),
    firstAirDateGte: z.coerce.string().optional(),
    firstAirDateLte: z.coerce.string().optional(),
@@ -185,7 +532,7 @@ index a949764..4914e52 100644
    studio: z.coerce.string().optional(),
    genre: z.coerce.string().optional(),
    keywords: z.coerce.string().optional(),
-@@ -125,6 +132,15 @@ discoverRoutes.get('/movies', async (req, res, next) => {
+@@ -125,6 +137,15 @@ discoverRoutes.get('/movies', async (req, res, next) => {
          : undefined,
        keywords,
        excludeKeywords,
@@ -201,7 +548,194 @@ index a949764..4914e52 100644
        withRuntimeGte: query.withRuntimeGte,
        withRuntimeLte: query.withRuntimeLte,
        voteAverageGte: query.voteAverageGte,
-@@ -437,6 +453,14 @@ discoverRoutes.get('/tv', async (req, res, next) => {
+@@ -364,6 +385,186 @@ discoverRoutes.get<{ studioId: string }>(
+   }
+ );
+ 
++// Custom mod: movies recently added to the selected streaming services.
++// Uses the Streaming Availability API when STREAMING_AVAILABILITY_API_KEY is
++// set, otherwise falls back to TMDB digital/TV release dates (last 90 days).
++const RECENT_PAGE_SIZE = 20;
++const recentMovieDetailCache = new Map<
++  string,
++  { source: RecentStreamingMovie[]; results: TmdbMovieResult[] }
++>();
++
++const mapWithConcurrency = async <T, R>(
++  items: T[],
++  limit: number,
++  fn: (item: T) => Promise<R>
++): Promise<R[]> => {
++  const results: R[] = new Array(items.length);
++  let next = 0;
++  const workers = Array.from(
++    { length: Math.min(limit, items.length) },
++    async () => {
++      while (next < items.length) {
++        const index = next++;
++        results[index] = await fn(items[index]);
++      }
++    }
++  );
++  await Promise.all(workers);
++  return results;
++};
++
++discoverRoutes.get('/movies/recent-streaming', async (req, res, next) => {
++  const tmdb = createTmdbWithRegionLanguage(req.user);
++  const page = Math.max(1, Number(req.query.page) || 1);
++  const watchRegion = String(req.query.watchRegion || 'US').toUpperCase();
++  const watchProviders = String(req.query.watchProviders || '');
++  const providerIds = watchProviders
++    .split('|')
++    .map((v) => Number(v))
++    .filter((v) => Number.isFinite(v) && v > 0);
++  const language = req.locale ?? (req.query.language as string | undefined);
++
++  const respond = async (
++    pageResults: TmdbMovieResult[],
++    totalResults: number
++  ) => {
++    const media = await Media.getRelatedMedia(
++      req.user,
++      pageResults.map((result) => ({
++        tmdbId: result.id,
++        mediaType: MediaType.MOVIE,
++      })),
++      { includeActiveRequest: true }
++    );
++    return res.status(200).json({
++      page,
++      totalPages: Math.max(1, Math.ceil(totalResults / RECENT_PAGE_SIZE)),
++      totalResults,
++      keywords: [],
++      results: pageResults.map((result) =>
++        mapMovieResult(
++          result,
++          media.find(
++            (m) => m.tmdbId === result.id && m.mediaType === MediaType.MOVIE
++          )
++        )
++      ),
++    });
++  };
++
++  try {
++    const sa = getStreamingAvailability();
++    if (sa && providerIds.length > 0) {
++      try {
++        const providers = await tmdb.getMovieWatchProviders({ watchRegion });
++        const names = providers
++          .filter((p) => providerIds.includes(p.provider_id))
++          .map((p) => p.provider_name);
++        const serviceIds = await sa.matchServices(watchRegion, names);
++
++        if (serviceIds.length > 0) {
++          const recent = await sa.getRecentMovies(watchRegion, serviceIds);
++          const cacheKey = `${watchRegion}|${serviceIds
++            .sort()
++            .join(',')}|${language ?? ''}`;
++          let cached = recentMovieDetailCache.get(cacheKey);
++
++          if (!cached || cached.source !== recent) {
++            const details = await mapWithConcurrency(recent, 6, async (m) => {
++              try {
++                return await tmdb.getMovie({ movieId: m.tmdbId, language });
++              } catch {
++                return null;
++              }
++            });
++            const results: TmdbMovieResult[] = details
++              .filter((d): d is NonNullable<typeof d> => !!d && !d.adult)
++              .map(
++                (d): TmdbMovieResult => ({
++                id: d.id,
++                media_type: 'movie',
++                adult: d.adult,
++                genre_ids: (d.genres ?? []).map((g) => g.id),
++                original_language: d.original_language,
++                original_title: d.original_title,
++                overview: d.overview ?? '',
++                popularity: d.popularity,
++                release_date: d.release_date,
++                title: d.title,
++                video: d.video,
++                vote_average: d.vote_average,
++                vote_count: d.vote_count,
++                backdrop_path: d.backdrop_path,
++                poster_path: d.poster_path,
++              })
++              )
++              .sort((a, b) => b.popularity - a.popularity);
++            cached = { source: recent, results };
++            recentMovieDetailCache.set(cacheKey, cached);
++          }
++
++          const start = (page - 1) * RECENT_PAGE_SIZE;
++          return await respond(
++            cached.results.slice(start, start + RECENT_PAGE_SIZE),
++            cached.results.length
++          );
++        }
++      } catch (e) {
++        logger.warn(
++          'Streaming Availability lookup failed; falling back to TMDB',
++          { label: 'API', errorMessage: e.message }
++        );
++      }
++    }
++
++    // Fallback: TMDB digital (4) / TV (6) releases in the last 90 days.
++    const day = 24 * 60 * 60 * 1000;
++    const iso = (t: number) => new Date(t).toISOString().split('T')[0];
++    const data = await tmdb.getDiscoverMovies({
++      page,
++      language,
++      watchRegion,
++      watchProviders: watchProviders || undefined,
++      watchMonetizationTypes: 'flatrate',
++      releaseDateGte: iso(Date.now() - 90 * day),
++      releaseDateLte: iso(Date.now()),
++      releaseType: '4|6',
++    });
++    const media = await Media.getRelatedMedia(
++      req.user,
++      data.results.map((result) => ({
++        tmdbId: result.id,
++        mediaType: MediaType.MOVIE,
++      })),
++      { includeActiveRequest: true }
++    );
++    return res.status(200).json({
++      page: data.page,
++      totalPages: data.total_pages,
++      totalResults: data.total_results,
++      keywords: [],
++      results: data.results.map((result) =>
++        mapMovieResult(
++          result,
++          media.find(
++            (m) => m.tmdbId === result.id && m.mediaType === MediaType.MOVIE
++          )
++        )
++      ),
++    });
++  } catch (e) {
++    logger.debug('Something went wrong retrieving recent streaming movies', {
++      label: 'API',
++      errorMessage: e.message,
++    });
++    return next({
++      status: 500,
++      message: 'Unable to retrieve recently released movies.',
++    });
++  }
++});
++
+ discoverRoutes.get('/movies/upcoming', async (req, res, next) => {
+   const tmdb = createTmdbWithRegionLanguage(req.user);
+ 
+@@ -437,6 +638,14 @@ discoverRoutes.get('/tv', async (req, res, next) => {
        originalLanguage: query.language,
        keywords,
        excludeKeywords,
@@ -217,40 +751,42 @@ index a949764..4914e52 100644
        withRuntimeLte: query.withRuntimeLte,
        voteAverageGte: query.voteAverageGte,
 diff --git a/src/components/Discover/CreateSlider/index.tsx b/src/components/Discover/CreateSlider/index.tsx
-index db80351..170bdcd 100644
+index db80351..f53ad4b 100644
 --- a/src/components/Discover/CreateSlider/index.tsx
 +++ b/src/components/Discover/CreateSlider/index.tsx
-@@ -6,6 +6,10 @@ import { WatchProviderSelector } from '@app/components/Selector';
+@@ -6,6 +6,12 @@ import { WatchProviderSelector } from '@app/components/Selector';
  import { encodeURIExtraParams } from '@app/hooks/useDiscover';
  import useToasts from '@app/hooks/useToasts';
  import defineMessages from '@app/utils/defineMessages';
 +import {
++  RECENT_MOVIE_URL,
++  RECENT_TV_URL,
 +  recentMovieStreamingParams,
 +  recentTvStreamingParams,
 +} from '@app/utils/recentStreaming';
  import type {
    TmdbCompanySearchResponse,
    TmdbGenre,
-@@ -295,6 +299,18 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+@@ -295,6 +301,18 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
        params: 'watchRegion=$regionValue&watchProviders=$providersValue',
        titlePlaceholderText: intl.formatMessage(messages.slidernameplaceholder),
      },
 +    {
 +      type: DiscoverSliderType.RECENT_MOVIE_STREAMING,
 +      title: intl.formatMessage(sliderTitles.recentmoviestreaming),
-+      dataUrl: '/api/v1/discover/movies',
++      dataUrl: RECENT_MOVIE_URL,
 +      titlePlaceholderText: intl.formatMessage(messages.slidernameplaceholder),
 +    },
 +    {
 +      type: DiscoverSliderType.RECENT_TV_STREAMING,
 +      title: intl.formatMessage(sliderTitles.recenttvstreaming),
-+      dataUrl: '/api/v1/discover/tv',
++      dataUrl: RECENT_TV_URL,
 +      titlePlaceholderText: intl.formatMessage(messages.slidernameplaceholder),
 +    },
    ];
  
    return (
-@@ -437,6 +453,7 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+@@ -437,6 +455,7 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
              );
              break;
            case DiscoverSliderType.TMDB_MOVIE_STREAMING_SERVICES:
@@ -258,7 +794,7 @@ index db80351..170bdcd 100644
              dataInput = (
                <WatchProviderSelector
                  type={'movie'}
-@@ -454,6 +471,7 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+@@ -454,6 +473,7 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
              );
              break;
            case DiscoverSliderType.TMDB_TV_STREAMING_SERVICES:
@@ -266,7 +802,7 @@ index db80351..170bdcd 100644
              dataInput = (
                <WatchProviderSelector
                  type={'tv'}
-@@ -543,6 +561,12 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+@@ -543,6 +563,12 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
                    )}
                    extraParams={
                      activeOption.type ===
@@ -294,6 +830,86 @@ index c24a059..78a1c49 100644
        default:
          return 'Unknown Slider';
      }
+diff --git a/src/components/Discover/RecentStreaming/index.tsx b/src/components/Discover/RecentStreaming/index.tsx
+new file mode 100644
+index 0000000..986cce5
+--- /dev/null
++++ b/src/components/Discover/RecentStreaming/index.tsx
+@@ -0,0 +1,74 @@
++// Custom mod: full-page "See more" view for the Recently Released sliders.
++import Header from '@app/components/Common/Header';
++import ListView from '@app/components/Common/ListView';
++import PageTitle from '@app/components/Common/PageTitle';
++import { sliderTitles } from '@app/components/Discover/constants';
++import useDiscover from '@app/hooks/useDiscover';
++import ErrorPage from '@app/pages/_error';
++import {
++  RECENT_MOVIE_URL,
++  RECENT_TV_URL,
++  recentMovieStreamingOptions,
++  recentTvStreamingOptions,
++} from '@app/utils/recentStreaming';
++import type { MovieResult, TvResult } from '@server/models/Search';
++import { useRouter } from 'next/router';
++import { useIntl } from 'react-intl';
++
++type RecentStreamingProps = {
++  mediaType: 'movies' | 'tv';
++};
++
++const RecentStreaming = ({ mediaType }: RecentStreamingProps) => {
++  const intl = useIntl();
++  const router = useRouter();
++  const data = typeof router.query.data === 'string' ? router.query.data : '';
++  const queryTitle =
++    typeof router.query.title === 'string' ? router.query.title : '';
++  const title =
++    queryTitle ||
++    intl.formatMessage(
++      mediaType === 'movies'
++        ? sliderTitles.recentmoviestreaming
++        : sliderTitles.recenttvstreaming
++    );
++
++  const {
++    isLoadingInitialData,
++    isEmpty,
++    isLoadingMore,
++    isReachingEnd,
++    titles,
++    fetchMore,
++    error,
++  } = useDiscover<MovieResult | TvResult>(
++    mediaType === 'movies' ? RECENT_MOVIE_URL : RECENT_TV_URL,
++    mediaType === 'movies'
++      ? recentMovieStreamingOptions(data)
++      : recentTvStreamingOptions(data)
++  );
++
++  if (error) {
++    return <ErrorPage statusCode={500} />;
++  }
++
++  return (
++    <>
++      <PageTitle title={title} />
++      <div className="mb-5 mt-1">
++        <Header>{title}</Header>
++      </div>
++      <ListView
++        items={titles}
++        isEmpty={isEmpty}
++        isLoading={
++          isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
++        }
++        isReachingEnd={isReachingEnd}
++        onScrollBottom={fetchMore}
++      />
++    </>
++  );
++};
++
++export default RecentStreaming;
 diff --git a/src/components/Discover/constants.ts b/src/components/Discover/constants.ts
 index 4ce5e34..97ef1e4 100644
 --- a/src/components/Discover/constants.ts
@@ -308,21 +924,24 @@ index 4ce5e34..97ef1e4 100644
  
  export const QueryFilterOptions = z.object({
 diff --git a/src/components/Discover/index.tsx b/src/components/Discover/index.tsx
-index 2a6313b..d1022a3 100644
+index 2a6313b..8613a75 100644
 --- a/src/components/Discover/index.tsx
 +++ b/src/components/Discover/index.tsx
-@@ -19,6 +19,10 @@ import useToasts from '@app/hooks/useToasts';
+@@ -19,6 +19,13 @@ import useToasts from '@app/hooks/useToasts';
  import { Permission, useUser } from '@app/hooks/useUser';
  import globalMessages from '@app/i18n/globalMessages';
  import defineMessages from '@app/utils/defineMessages';
 +import {
++  RECENT_MOVIE_URL,
++  RECENT_TV_URL,
 +  recentMovieStreamingParams,
++  recentStreamingLink,
 +  recentTvStreamingParams,
 +} from '@app/utils/recentStreaming';
  import { Transition } from '@headlessui/react';
  import {
    ArrowDownOnSquareIcon,
-@@ -398,6 +402,26 @@ const Discover = () => {
+@@ -398,6 +405,32 @@ const Discover = () => {
                />
              );
              break;
@@ -331,8 +950,13 @@ index 2a6313b..d1022a3 100644
 +              <MediaSlider
 +                sliderKey={`custom-slider-${slider.id}`}
 +                title={slider.title ?? ''}
-+                url="/api/v1/discover/movies"
++                url={RECENT_MOVIE_URL}
 +                extraParams={recentMovieStreamingParams(slider.data)}
++                linkUrl={recentStreamingLink(
++                  'movies',
++                  slider.data,
++                  slider.title
++                )}
 +              />
 +            );
 +            break;
@@ -341,30 +965,63 @@ index 2a6313b..d1022a3 100644
 +              <MediaSlider
 +                sliderKey={`custom-slider-${slider.id}`}
 +                title={slider.title ?? ''}
-+                url="/api/v1/discover/tv"
++                url={RECENT_TV_URL}
 +                extraParams={recentTvStreamingParams(slider.data)}
++                linkUrl={recentStreamingLink('tv', slider.data, slider.title)}
 +              />
 +            );
 +            break;
          }
  
          if (isEditing) {
+diff --git a/src/pages/discover/recent/movies.tsx b/src/pages/discover/recent/movies.tsx
+new file mode 100644
+index 0000000..0dfad50
+--- /dev/null
++++ b/src/pages/discover/recent/movies.tsx
+@@ -0,0 +1,8 @@
++import RecentStreaming from '@app/components/Discover/RecentStreaming';
++import type { NextPage } from 'next';
++
++const RecentStreamingMoviesPage: NextPage = () => {
++  return <RecentStreaming mediaType="movies" />;
++};
++
++export default RecentStreamingMoviesPage;
+diff --git a/src/pages/discover/recent/tv.tsx b/src/pages/discover/recent/tv.tsx
+new file mode 100644
+index 0000000..f6e4584
+--- /dev/null
++++ b/src/pages/discover/recent/tv.tsx
+@@ -0,0 +1,8 @@
++import RecentStreaming from '@app/components/Discover/RecentStreaming';
++import type { NextPage } from 'next';
++
++const RecentStreamingTvPage: NextPage = () => {
++  return <RecentStreaming mediaType="tv" />;
++};
++
++export default RecentStreamingTvPage;
 diff --git a/src/utils/recentStreaming.ts b/src/utils/recentStreaming.ts
 new file mode 100644
-index 0000000..94d7346
+index 0000000..455aa95
 --- /dev/null
 +++ b/src/utils/recentStreaming.ts
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,82 @@
 +// Custom mod: "recently released on streaming services" Discover sliders.
 +//
 +// Slider data uses the same format as the built-in streaming-service sliders:
 +// "<region>,<providerId>|<providerId>|..." (for example "US,8|1899|337").
 +//
-+// The date window is calculated each time the slider loads, so it always
-+// covers the last N days without anyone having to update it.
++// Movies come from /api/v1/discover/movies/recent-streaming, which uses the
++// Streaming Availability API (date each movie was added to the service) when
++// STREAMING_AVAILABILITY_API_KEY is set, and TMDB release dates otherwise.
++//
++// Series use TMDB directly. The date window is calculated each time the slider
++// loads, so it always covers the last N days.
 +
-+/** How far back a movie's streaming (digital/TV) release may be. */
-+export const RECENT_MOVIE_DAYS = 90;
++export const RECENT_MOVIE_URL = '/api/v1/discover/movies/recent-streaming';
++export const RECENT_TV_URL = '/api/v1/discover/tv';
 +
 +/**
 + * How far back a series' most recent episode may have aired. Because this
@@ -380,48 +1037,59 @@ index 0000000..94d7346
 + */
 +export const RECENT_TV_EXCLUDED_GENRES = '10763|10766|10767';
 +
-+/**
-+ * TMDB movie release types: 4 = Digital, 6 = TV. These cover streaming
-+ * premieres (e.g. Netflix originals) and theatrical films' streaming debuts.
-+ */
-+export const RECENT_MOVIE_RELEASE_TYPES = '4|6';
-+
 +const isoDaysAgo = (days: number): string =>
 +  new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 +
 +const splitData = (data?: string | null) => {
 +  const [region = '', providers = ''] = (data ?? '').split(',');
++  return { region, providers };
++};
++
++/** Query parameters (unencoded) for the movie slider / page. */
++export const recentMovieStreamingOptions = (
++  data?: string | null
++): Record<string, string> => {
++  const { region, providers } = splitData(data);
++  return { watchRegion: region, watchProviders: providers };
++};
++
++/** Query parameters (unencoded) for the series slider / page. */
++export const recentTvStreamingOptions = (
++  data?: string | null
++): Record<string, string> => {
++  const { region, providers } = splitData(data);
 +  return {
-+    region: encodeURIComponent(region),
-+    providers: encodeURIComponent(providers),
++    watchRegion: region,
++    watchProviders: providers,
++    watchMonetizationTypes: 'flatrate',
++    airDateGte: isoDaysAgo(RECENT_TV_DAYS),
++    airDateLte: isoDaysAgo(0),
++    excludeGenres: RECENT_TV_EXCLUDED_GENRES,
++    sortBy: 'popularity.desc',
 +  };
 +};
 +
-+export const recentMovieStreamingParams = (data?: string | null): string => {
-+  const { region, providers } = splitData(data);
-+  return [
-+    `watchRegion=${region}`,
-+    `watchProviders=${providers}`,
-+    'watchMonetizationTypes=flatrate',
-+    `releaseDateGte=${isoDaysAgo(RECENT_MOVIE_DAYS)}`,
-+    `releaseDateLte=${isoDaysAgo(0)}`,
-+    `releaseType=${encodeURIComponent(RECENT_MOVIE_RELEASE_TYPES)}`,
-+    'sortBy=popularity.desc',
-+  ].join('&');
-+};
++const toQuery = (options: Record<string, string>): string =>
++  Object.entries(options)
++    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
++    .join('&');
 +
-+export const recentTvStreamingParams = (data?: string | null): string => {
-+  const { region, providers } = splitData(data);
-+  return [
-+    `watchRegion=${region}`,
-+    `watchProviders=${providers}`,
-+    'watchMonetizationTypes=flatrate',
-+    `airDateGte=${isoDaysAgo(RECENT_TV_DAYS)}`,
-+    `airDateLte=${isoDaysAgo(0)}`,
-+    `excludeGenres=${encodeURIComponent(RECENT_TV_EXCLUDED_GENRES)}`,
-+    'sortBy=popularity.desc',
-+  ].join('&');
-+};
++export const recentMovieStreamingParams = (data?: string | null): string =>
++  toQuery(recentMovieStreamingOptions(data));
++
++export const recentTvStreamingParams = (data?: string | null): string =>
++  toQuery(recentTvStreamingOptions(data));
++
++/** "See more" page link for a slider. */
++export const recentStreamingLink = (
++  mediaType: 'movies' | 'tv',
++  data?: string | null,
++  title?: string | null
++): string =>
++  `/discover/recent/${mediaType}?${toQuery({
++    data: data ?? '',
++    title: title ?? '',
++  })}`;
 -- 
 2.43.0
 
