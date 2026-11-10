@@ -1,0 +1,363 @@
+From 0fc631ea5dfa0798ac4fd71bc6c20c53138e37f8 Mon Sep 17 00:00:00 2001
+From: seerr-mod <mod@localhost>
+Date: Mon, 9 Nov 2026 20:06:05 -0800
+Subject: [PATCH] Add 'Recently Released' streaming-service Discover sliders
+
+---
+ server/api/themoviedb/index.ts                | 27 ++++++++
+ server/constants/discover.ts                  |  4 ++
+ server/routes/discover.ts                     | 24 +++++++
+ .../Discover/CreateSlider/index.tsx           | 24 +++++++
+ .../Discover/DiscoverSliderEdit/index.tsx     |  4 ++
+ src/components/Discover/constants.ts          |  2 +
+ src/components/Discover/index.tsx             | 24 +++++++
+ src/utils/recentStreaming.ts                  | 67 +++++++++++++++++++
+ 8 files changed, 176 insertions(+)
+ create mode 100644 src/utils/recentStreaming.ts
+
+diff --git a/server/api/themoviedb/index.ts b/server/api/themoviedb/index.ts
+index 4693b3e..9053d95 100644
+--- a/server/api/themoviedb/index.ts
++++ b/server/api/themoviedb/index.ts
+@@ -91,6 +91,11 @@ interface DiscoverMovieOptions {
+   language?: string;
+   primaryReleaseDateGte?: string;
+   primaryReleaseDateLte?: string;
++  releaseDateGte?: string;
++  releaseDateLte?: string;
++  releaseType?: string;
++  excludeGenres?: string;
++  watchMonetizationTypes?: string;
+   withRuntimeGte?: string;
+   withRuntimeLte?: string;
+   voteAverageGte?: string;
+@@ -116,6 +121,10 @@ interface DiscoverTvOptions {
+   language?: string;
+   firstAirDateGte?: string;
+   firstAirDateLte?: string;
++  airDateGte?: string;
++  airDateLte?: string;
++  excludeGenres?: string;
++  watchMonetizationTypes?: string;
+   withRuntimeGte?: string;
+   withRuntimeLte?: string;
+   voteAverageGte?: string;
+@@ -685,6 +694,11 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
+     language = this.locale,
+     primaryReleaseDateGte,
+     primaryReleaseDateLte,
++    releaseDateGte,
++    releaseDateLte,
++    releaseType,
++    excludeGenres,
++    watchMonetizationTypes,
+     originalLanguage,
+     genre,
+     studio,
+@@ -738,6 +752,11 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
+             !primaryReleaseDateLte && primaryReleaseDateGte
+               ? defaultFutureDate
+               : primaryReleaseDateLte,
++          'release_date.gte': releaseDateGte,
++          'release_date.lte': releaseDateLte,
++          with_release_type: releaseType,
++          without_genres: excludeGenres,
++          with_watch_monetization_types: watchMonetizationTypes,
+           with_genres: genre,
+           with_companies: studio,
+           with_keywords: keywords,
+@@ -771,6 +790,10 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
+     language = this.locale,
+     firstAirDateGte,
+     firstAirDateLte,
++    airDateGte,
++    airDateLte,
++    excludeGenres,
++    watchMonetizationTypes,
+     includeEmptyReleaseDate = false,
+     originalLanguage,
+     genre,
+@@ -825,6 +848,10 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
+                 ? undefined
+                 : this.originalLanguage,
+           include_null_first_air_dates: includeEmptyReleaseDate,
++          'air_date.gte': airDateGte,
++          'air_date.lte': airDateLte,
++          without_genres: excludeGenres,
++          with_watch_monetization_types: watchMonetizationTypes,
+           with_genres: genre,
+           with_networks: network,
+           with_keywords: keywords,
+diff --git a/server/constants/discover.ts b/server/constants/discover.ts
+index fda0682..006800a 100644
+--- a/server/constants/discover.ts
++++ b/server/constants/discover.ts
+@@ -22,6 +22,10 @@ export enum DiscoverSliderType {
+   TMDB_NETWORK,
+   TMDB_MOVIE_STREAMING_SERVICES,
+   TMDB_TV_STREAMING_SERVICES,
++  // Custom: recently released on streaming services (rolling date window).
++  // High fixed values so future upstream slider types can't collide.
++  RECENT_MOVIE_STREAMING = 100,
++  RECENT_TV_STREAMING = 101,
+ }
+ 
+ export const defaultSliders: Partial<DiscoverSlider>[] = [
+diff --git a/server/routes/discover.ts b/server/routes/discover.ts
+index a949764..4914e52 100644
+--- a/server/routes/discover.ts
++++ b/server/routes/discover.ts
+@@ -68,6 +68,13 @@ const QueryFilterOptions = z.object({
+   primaryReleaseDateLte: z.coerce.string().optional(),
+   firstAirDateGte: z.coerce.string().optional(),
+   firstAirDateLte: z.coerce.string().optional(),
++  releaseDateGte: z.coerce.string().optional(),
++  releaseDateLte: z.coerce.string().optional(),
++  releaseType: z.coerce.string().optional(),
++  airDateGte: z.coerce.string().optional(),
++  airDateLte: z.coerce.string().optional(),
++  excludeGenres: z.coerce.string().optional(),
++  watchMonetizationTypes: z.coerce.string().optional(),
+   studio: z.coerce.string().optional(),
+   genre: z.coerce.string().optional(),
+   keywords: z.coerce.string().optional(),
+@@ -125,6 +132,15 @@ discoverRoutes.get('/movies', async (req, res, next) => {
+         : undefined,
+       keywords,
+       excludeKeywords,
++      releaseDateGte: query.releaseDateGte
++        ? new Date(query.releaseDateGte).toISOString().split('T')[0]
++        : undefined,
++      releaseDateLte: query.releaseDateLte
++        ? new Date(query.releaseDateLte).toISOString().split('T')[0]
++        : undefined,
++      releaseType: query.releaseType,
++      excludeGenres: query.excludeGenres,
++      watchMonetizationTypes: query.watchMonetizationTypes,
+       withRuntimeGte: query.withRuntimeGte,
+       withRuntimeLte: query.withRuntimeLte,
+       voteAverageGte: query.voteAverageGte,
+@@ -437,6 +453,14 @@ discoverRoutes.get('/tv', async (req, res, next) => {
+       originalLanguage: query.language,
+       keywords,
+       excludeKeywords,
++      airDateGte: query.airDateGte
++        ? new Date(query.airDateGte).toISOString().split('T')[0]
++        : undefined,
++      airDateLte: query.airDateLte
++        ? new Date(query.airDateLte).toISOString().split('T')[0]
++        : undefined,
++      excludeGenres: query.excludeGenres,
++      watchMonetizationTypes: query.watchMonetizationTypes,
+       withRuntimeGte: query.withRuntimeGte,
+       withRuntimeLte: query.withRuntimeLte,
+       voteAverageGte: query.voteAverageGte,
+diff --git a/src/components/Discover/CreateSlider/index.tsx b/src/components/Discover/CreateSlider/index.tsx
+index db80351..170bdcd 100644
+--- a/src/components/Discover/CreateSlider/index.tsx
++++ b/src/components/Discover/CreateSlider/index.tsx
+@@ -6,6 +6,10 @@ import { WatchProviderSelector } from '@app/components/Selector';
+ import { encodeURIExtraParams } from '@app/hooks/useDiscover';
+ import useToasts from '@app/hooks/useToasts';
+ import defineMessages from '@app/utils/defineMessages';
++import {
++  recentMovieStreamingParams,
++  recentTvStreamingParams,
++} from '@app/utils/recentStreaming';
+ import type {
+   TmdbCompanySearchResponse,
+   TmdbGenre,
+@@ -295,6 +299,18 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+       params: 'watchRegion=$regionValue&watchProviders=$providersValue',
+       titlePlaceholderText: intl.formatMessage(messages.slidernameplaceholder),
+     },
++    {
++      type: DiscoverSliderType.RECENT_MOVIE_STREAMING,
++      title: intl.formatMessage(sliderTitles.recentmoviestreaming),
++      dataUrl: '/api/v1/discover/movies',
++      titlePlaceholderText: intl.formatMessage(messages.slidernameplaceholder),
++    },
++    {
++      type: DiscoverSliderType.RECENT_TV_STREAMING,
++      title: intl.formatMessage(sliderTitles.recenttvstreaming),
++      dataUrl: '/api/v1/discover/tv',
++      titlePlaceholderText: intl.formatMessage(messages.slidernameplaceholder),
++    },
+   ];
+ 
+   return (
+@@ -437,6 +453,7 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+             );
+             break;
+           case DiscoverSliderType.TMDB_MOVIE_STREAMING_SERVICES:
++          case DiscoverSliderType.RECENT_MOVIE_STREAMING:
+             dataInput = (
+               <WatchProviderSelector
+                 type={'movie'}
+@@ -454,6 +471,7 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+             );
+             break;
+           case DiscoverSliderType.TMDB_TV_STREAMING_SERVICES:
++          case DiscoverSliderType.RECENT_TV_STREAMING:
+             dataInput = (
+               <WatchProviderSelector
+                 type={'tv'}
+@@ -543,6 +561,12 @@ const CreateSlider = ({ onCreate, slider }: CreateSliderProps) => {
+                   )}
+                   extraParams={
+                     activeOption.type ===
++                    DiscoverSliderType.RECENT_MOVIE_STREAMING
++                      ? recentMovieStreamingParams(values.data)
++                      : activeOption.type ===
++                          DiscoverSliderType.RECENT_TV_STREAMING
++                        ? recentTvStreamingParams(values.data)
++                        : activeOption.type ===
+                       DiscoverSliderType.TMDB_MOVIE_STREAMING_SERVICES ||
+                     activeOption.type ===
+                       DiscoverSliderType.TMDB_TV_STREAMING_SERVICES
+diff --git a/src/components/Discover/DiscoverSliderEdit/index.tsx b/src/components/Discover/DiscoverSliderEdit/index.tsx
+index c24a059..78a1c49 100644
+--- a/src/components/Discover/DiscoverSliderEdit/index.tsx
++++ b/src/components/Discover/DiscoverSliderEdit/index.tsx
+@@ -169,6 +169,10 @@ const DiscoverSliderEdit = ({
+         return intl.formatMessage(sliderTitles.tmdbmoviestreamingservices);
+       case DiscoverSliderType.TMDB_TV_STREAMING_SERVICES:
+         return intl.formatMessage(sliderTitles.tmdbtvstreamingservices);
++      case DiscoverSliderType.RECENT_MOVIE_STREAMING:
++        return intl.formatMessage(sliderTitles.recentmoviestreaming);
++      case DiscoverSliderType.RECENT_TV_STREAMING:
++        return intl.formatMessage(sliderTitles.recenttvstreaming);
+       default:
+         return 'Unknown Slider';
+     }
+diff --git a/src/components/Discover/constants.ts b/src/components/Discover/constants.ts
+index 4ce5e34..97ef1e4 100644
+--- a/src/components/Discover/constants.ts
++++ b/src/components/Discover/constants.ts
+@@ -88,6 +88,8 @@ export const sliderTitles = defineMessages('components.Discover', {
+   tmdbsearch: 'TMDB Search',
+   tmdbmoviestreamingservices: 'TMDB Movie Streaming Services',
+   tmdbtvstreamingservices: 'TMDB TV Streaming Services',
++  recentmoviestreaming: 'Recently Released Movies (Streaming Services)',
++  recenttvstreaming: 'Recently Released Series (Streaming Services)',
+ });
+ 
+ export const QueryFilterOptions = z.object({
+diff --git a/src/components/Discover/index.tsx b/src/components/Discover/index.tsx
+index 2a6313b..d1022a3 100644
+--- a/src/components/Discover/index.tsx
++++ b/src/components/Discover/index.tsx
+@@ -19,6 +19,10 @@ import useToasts from '@app/hooks/useToasts';
+ import { Permission, useUser } from '@app/hooks/useUser';
+ import globalMessages from '@app/i18n/globalMessages';
+ import defineMessages from '@app/utils/defineMessages';
++import {
++  recentMovieStreamingParams,
++  recentTvStreamingParams,
++} from '@app/utils/recentStreaming';
+ import { Transition } from '@headlessui/react';
+ import {
+   ArrowDownOnSquareIcon,
+@@ -398,6 +402,26 @@ const Discover = () => {
+               />
+             );
+             break;
++          case DiscoverSliderType.RECENT_MOVIE_STREAMING:
++            sliderComponent = (
++              <MediaSlider
++                sliderKey={`custom-slider-${slider.id}`}
++                title={slider.title ?? ''}
++                url="/api/v1/discover/movies"
++                extraParams={recentMovieStreamingParams(slider.data)}
++              />
++            );
++            break;
++          case DiscoverSliderType.RECENT_TV_STREAMING:
++            sliderComponent = (
++              <MediaSlider
++                sliderKey={`custom-slider-${slider.id}`}
++                title={slider.title ?? ''}
++                url="/api/v1/discover/tv"
++                extraParams={recentTvStreamingParams(slider.data)}
++              />
++            );
++            break;
+         }
+ 
+         if (isEditing) {
+diff --git a/src/utils/recentStreaming.ts b/src/utils/recentStreaming.ts
+new file mode 100644
+index 0000000..94d7346
+--- /dev/null
++++ b/src/utils/recentStreaming.ts
+@@ -0,0 +1,67 @@
++// Custom mod: "recently released on streaming services" Discover sliders.
++//
++// Slider data uses the same format as the built-in streaming-service sliders:
++// "<region>,<providerId>|<providerId>|..." (for example "US,8|1899|337").
++//
++// The date window is calculated each time the slider loads, so it always
++// covers the last N days without anyone having to update it.
++
++/** How far back a movie's streaming (digital/TV) release may be. */
++export const RECENT_MOVIE_DAYS = 90;
++
++/**
++ * How far back a series' most recent episode may have aired. Because this
++ * checks every episode's air date (not just the premiere), a returning show
++ * with a new season counts as recently released.
++ */
++export const RECENT_TV_DAYS = 60;
++
++/**
++ * TMDB TV genres left out of the series slider so that daily or weekly
++ * programmes don't crowd out actual new seasons:
++ * 10763 News, 10766 Soap, 10767 Talk.
++ */
++export const RECENT_TV_EXCLUDED_GENRES = '10763|10766|10767';
++
++/**
++ * TMDB movie release types: 4 = Digital, 6 = TV. These cover streaming
++ * premieres (e.g. Netflix originals) and theatrical films' streaming debuts.
++ */
++export const RECENT_MOVIE_RELEASE_TYPES = '4|6';
++
++const isoDaysAgo = (days: number): string =>
++  new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
++
++const splitData = (data?: string | null) => {
++  const [region = '', providers = ''] = (data ?? '').split(',');
++  return {
++    region: encodeURIComponent(region),
++    providers: encodeURIComponent(providers),
++  };
++};
++
++export const recentMovieStreamingParams = (data?: string | null): string => {
++  const { region, providers } = splitData(data);
++  return [
++    `watchRegion=${region}`,
++    `watchProviders=${providers}`,
++    'watchMonetizationTypes=flatrate',
++    `releaseDateGte=${isoDaysAgo(RECENT_MOVIE_DAYS)}`,
++    `releaseDateLte=${isoDaysAgo(0)}`,
++    `releaseType=${encodeURIComponent(RECENT_MOVIE_RELEASE_TYPES)}`,
++    'sortBy=popularity.desc',
++  ].join('&');
++};
++
++export const recentTvStreamingParams = (data?: string | null): string => {
++  const { region, providers } = splitData(data);
++  return [
++    `watchRegion=${region}`,
++    `watchProviders=${providers}`,
++    'watchMonetizationTypes=flatrate',
++    `airDateGte=${isoDaysAgo(RECENT_TV_DAYS)}`,
++    `airDateLte=${isoDaysAgo(0)}`,
++    `excludeGenres=${encodeURIComponent(RECENT_TV_EXCLUDED_GENRES)}`,
++    'sortBy=popularity.desc',
++  ].join('&');
++};
+-- 
+2.43.0
+
